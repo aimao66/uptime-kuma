@@ -1,4 +1,0 @@
-# Set Unikraft Cloud access token
-export UKC_TOKEN=cm9ib3QkYWltYW9xcS51c2Vycy5rcmFmdGNsb3VkOjFoS2gwdmJ2TlRDSlBoUkVMckdaYmxLaUFFNmJJTDlo
-# Set metro to Frankfurt, DE
-export UKC_METRO=sin
