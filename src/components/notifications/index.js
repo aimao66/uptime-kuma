@@ -25,6 +25,7 @@ import Gotify from "./Gotify.vue";
 import GrafanaOncall from "./GrafanaOncall.vue";
 import GtxMessaging from "./GtxMessaging.vue";
 import HomeAssistant from "./HomeAssistant.vue";
+import Indigo from "./Indigo.vue";
 import HeiiOnCall from "./HeiiOnCall.vue";
 import Keep from "./Keep.vue";
 import Kook from "./Kook.vue";
@@ -42,6 +43,7 @@ import OneBot from "./OneBot.vue";
 import Onesender from "./Onesender.vue";
 import Ooredoo from "./Ooredoo.vue";
 import Opsgenie from "./Opsgenie.vue";
+import OpsiMate from "./OpsiMate.vue";
 import JiraServiceManagement from "./JiraServiceManagement.vue";
 import PagerDuty from "./PagerDuty.vue";
 import FlashDuty from "./FlashDuty.vue";
@@ -69,12 +71,14 @@ import Squadcast from "./Squadcast.vue";
 import SMSEagle from "./SMSEagle.vue";
 import Stackfield from "./Stackfield.vue";
 import STMP from "./SMTP.vue";
+import MicrosoftGraph from "./MicrosoftGraph.vue";
 import Teams from "./Teams.vue";
 import TechulusPush from "./TechulusPush.vue";
 import Telegram from "./Telegram.vue";
 import Teltonika from "./Teltonika.vue";
 import Telnyx from "./Telnyx.vue";
 import Threema from "./Threema.vue";
+import Trigv from "./Trigv.vue";
 import Twilio from "./Twilio.vue";
 import Webhook from "./Webhook.vue";
 import WeCom from "./WeCom.vue";
@@ -139,6 +143,7 @@ const NotificationFormList = {
     gotify: Gotify,
     GrafanaOncall: GrafanaOncall,
     HomeAssistant: HomeAssistant,
+    Indigo: Indigo,
     HeiiOnCall: HeiiOnCall,
     Keep: Keep,
     Kook: Kook,
@@ -156,6 +161,7 @@ const NotificationFormList = {
     Onesender: Onesender,
     Ooredoo: Ooredoo,
     Opsgenie: Opsgenie,
+    OpsiMate: OpsiMate,
     JiraServiceManagement: JiraServiceManagement,
     PagerDuty: PagerDuty,
     FlashDuty: FlashDuty,
@@ -183,12 +189,14 @@ const NotificationFormList = {
     squadcast: Squadcast,
     SMSEagle: SMSEagle,
     smtp: STMP,
+    MicrosoftGraph: MicrosoftGraph,
     stackfield: Stackfield,
     teams: Teams,
     telegram: Telegram,
     Teltonika: Teltonika,
     telnyx: Telnyx,
     threema: Threema,
+    trigv: Trigv,
     twilio: Twilio,
     Splunk: Splunk,
     SpugPush: SpugPush,

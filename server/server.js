@@ -3,20 +3,27 @@
  * node "server/server.js"
  * DO NOT require("./server") in other modules, it likely creates circular dependency!
  */
-import { getRandomInt, isDev, log, sleep } from "../src/util";
-import { auth, doubleCheckPassword, getDisableAuthSession, getSession } from "./better-auth";
+import {
+    initDayjs,
+    getSettings,
+    setSettings,
+    setting,
+    checkLogin,
+    allowDevAllOrigin,
+    printServerUrls,
+    allowDevOrigin,
+} from "./util";
+import { getRandomInt, isDevEnv, log, sleep } from "../src/util";
+import { auth, createHeaders, doubleCheckPassword, getDisableAuthSession, getSessionFromHeaders } from "./better-auth";
 import { createBetterAuthRouter, needSetup } from "./routers/better-auth-router";
+import { readApiKey } from "./auth";
+import { initAdminFromEnv } from "./initial-admin";
 import { betterAuthSocketHandler } from "./socket-handlers/better-auth-socket-handler";
 import { loadEnvFile } from "node:process";
-import * as fs from "node:fs";
 
 console.log("Welcome to Uptime Kuma");
 
-// As the log function need to use dayjs, it should be very top
-const dayjs = require("dayjs");
-dayjs.extend(require("dayjs/plugin/utc"));
-dayjs.extend(require("./modules/dayjs/plugin/timezone"));
-dayjs.extend(require("dayjs/plugin/customParseFormat"));
+initDayjs();
 
 // Load environment variables from `.env`
 try {
@@ -77,7 +84,7 @@ if (process.env.UPTIME_KUMA_WS_ORIGIN_CHECK === "bypass") {
     log.warn("server", "WebSocket Origin Check: " + process.env.UPTIME_KUMA_WS_ORIGIN_CHECK);
 }
 
-if (isDev || process.env.UPTIME_KUMA_DEBUG_INSPECTOR === "1") {
+if (isDevEnv() || process.env.UPTIME_KUMA_DEBUG_INSPECTOR === "1") {
     const inspector = require("inspector");
     let inspectorHost = "127.0.0.1";
 
@@ -107,8 +114,6 @@ log.debug("server", "Importing redbean-node");
 const { R } = require("redbean-node");
 log.debug("server", "Importing http-graceful-shutdown");
 const gracefulShutdown = require("http-graceful-shutdown");
-log.debug("server", "Importing prometheus-api-metrics");
-const prometheusAPIMetrics = require("prometheus-api-metrics");
 
 const { UptimeKumaServer } = require("./uptime-kuma-server");
 const server = UptimeKumaServer.getInstance();
@@ -119,15 +124,6 @@ log.debug("server", "Importing Monitor");
 const Monitor = require("./model/monitor");
 
 log.debug("server", "Importing Settings");
-const {
-    getSettings,
-    setSettings,
-    setting,
-    checkLogin,
-    allowDevAllOrigin,
-    printServerUrls,
-    allowDevOrigin,
-} = require("./util-server");
 
 log.debug("server", "Importing Notification");
 const { Notification } = require("./notification");
@@ -140,9 +136,18 @@ const Database = require("./database");
 
 log.debug("server", "Importing Background Jobs");
 const { initBackgroundJobs, stopBackgroundJobs } = require("./jobs");
+const { DeferredListsSender } = require("./login-lists");
+const { startStatsRefresh } = require("./stats-refresh");
 const { apiAuth } = require("./auth");
-const { Prometheus } = require("./prometheus");
+const {
+    Prometheus,
+    startPrometheusMetrics,
+    getPrometheusAPIMiddleware,
+    stopPrometheusMetrics,
+} = require("./prometheus");
 const { UptimeCalculator } = require("./uptime-calculator");
+const { MonitorStats } = require("./monitor-stats");
+const { socketRoom } = require("./heartbeat-emit");
 
 const hostname = config.hostname;
 
@@ -166,10 +171,11 @@ const testMode = !!args["test"] || false;
 const {
     sendNotificationList,
     sendHeartbeatList,
+    sendHeartbeatLists,
+    getHeartbeatHistory,
     sendInfo,
     sendProxyList,
     sendDockerHostList,
-    sendAPIKeyList,
     sendRemoteBrowserList,
     sendMonitorTypeList,
 } = require("./client");
@@ -188,7 +194,7 @@ const { maintenanceSocketHandler } = require("./socket-handlers/maintenance-sock
 const { apiKeySocketHandler } = require("./socket-handlers/api-key-socket-handler");
 const { generalSocketHandler } = require("./socket-handlers/general-socket-handler");
 const { Settings } = require("./settings");
-const apicache = require("./modules/apicache");
+const apicache = require("./utils/response-cache");
 const { resetChrome } = require("./monitor-types/real-browser-monitor-type");
 const { EmbeddedMariaDB } = require("./embedded-mariadb");
 const { SetupDatabase } = require("./setup-database");
@@ -226,6 +232,14 @@ app.use(function (req, res, next) {
 
     // Init Better Auth
     auth();
+
+    // Create the initial admin user from env, only when the database has no user yet
+    try {
+        await initAdminFromEnv();
+    } catch (e) {
+        log.error("auth", "Failed to create the initial admin user: " + e.message);
+        process.exit(1);
+    }
 
     // Database should be ready now
     await server.initAfterDatabaseReady();
@@ -274,7 +288,7 @@ app.use(function (req, res, next) {
         });
     });
 
-    if (isDev) {
+    if (isDevEnv()) {
         app.options("/*", async (request, response) => {
             allowDevOrigin(request, response);
             response.end();
@@ -287,35 +301,16 @@ app.use(function (req, res, next) {
             response.send("OK");
         });
 
-        app.get("/_e2e/take-sqlite-snapshot", async (request, response) => {
-            // Checkpoint WAL to flush all data to the main .db file, then copy.
-            // No close/reopen needed — the file is consistent after checkpoint.
-            await R.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-            fs.cpSync(Database.sqlitePath, `${Database.sqlitePath}.e2e-snapshot`);
-            response.send("Snapshot taken.");
-        });
-
-        app.get("/_e2e/restore-sqlite-snapshot", async (request, response) => {
-            if (!fs.existsSync(`${Database.sqlitePath}.e2e-snapshot`)) {
-                throw new Error("Snapshot doesn't exist.");
-            }
-
-            await Database.close();
-            try {
-                fs.cpSync(`${Database.sqlitePath}.e2e-snapshot`, Database.sqlitePath);
-            } catch (err) {
-                throw new Error("Unable to copy snapshot file.");
-            }
-            await Database.connect();
-
-            response.send("Snapshot restored.");
-        });
-
         app.post("/test-x-www-form-urlencoded", async (request, response) => {
             log.debug("test", request.headers);
             log.debug("test", request.body);
             response.send("OK");
         });
+    }
+
+    if (process.env.E2E_TEST === "1") {
+        const { e2eRouter } = await import("../test/e2e/e2e-router");
+        app.use(e2eRouter);
     }
 
     // Robots.txt
@@ -330,9 +325,23 @@ app.use(function (req, res, next) {
 
     // Basic Auth Router here
 
-    // Prometheus API metrics  /metrics
-    // With Basic Auth using the first user's username/password
-    app.get("/metrics", apiAuth, prometheusAPIMetrics());
+    // Prometheus API  /metrics  (Basic Auth, only when enabled in the settings)
+    app.get(
+        "/metrics",
+        async (req, res, next) => {
+            try {
+                if ((await setting("prometheusApiEnabled")) !== true) {
+                    res.sendStatus(404);
+                    return;
+                }
+                next();
+            } catch (e) {
+                next(e);
+            }
+        },
+        apiAuth,
+        (req, res, next) => getPrometheusAPIMiddleware()(req, res, next)
+    );
 
     app.use(
         "/",
@@ -351,6 +360,10 @@ app.use(function (req, res, next) {
     // API Router
     const apiRouter = require("./routers/api-router");
     app.use(apiRouter);
+
+    // MCP Router, a TypeScript module, so `require` hands back its namespace
+    const mcpRouter = require("./routers/mcp-router").default;
+    app.use(mcpRouter);
 
     // Status Page Router
     const statusPageRouter = require("./routers/status-page-router");
@@ -381,7 +394,14 @@ app.use(function (req, res, next) {
         let session;
 
         if (!(await Settings.get("disableAuth"))) {
-            session = await getSession(socket.request.headers.cookie);
+            let apiKey;
+
+            // API keys only work as a socket login when the API & MCP is enabled
+            if (await Settings.get("apiEnabled")) {
+                apiKey = readApiKey(socket.request.headers.authorization);
+            }
+
+            session = await getSessionFromHeaders(socket.request.headers.cookie, apiKey);
         } else {
             session = await getDisableAuthSession();
         }
@@ -389,6 +409,7 @@ app.use(function (req, res, next) {
         if (session) {
             socket.userID = session.user.id;
             socket.session = session;
+            socket.headers = createHeaders(socket.request.headers.cookie);
             socket.emit("session", session.user.username);
             log.debug("auth", `Session active:`, session.session.ipAddress, session.user.username);
         }
@@ -420,6 +441,10 @@ app.use(function (req, res, next) {
 
                 monitor.rabbitmqNodes = JSON.stringify(monitor.rabbitmqNodes);
 
+                // Config is never imported as a whole, only its known keys are copied
+                const clientConfig = monitor.config;
+                delete monitor.config;
+
                 /*
                  * List of frontend-only properties that should not be saved to the database.
                  * Should clean up before saving to the database.
@@ -436,6 +461,7 @@ app.use(function (req, res, next) {
                 }
 
                 bean.import(monitor);
+                bean.applyClientConfig(clientConfig);
                 // Map camelCase frontend property to snake_case database column
                 if (monitor.retryOnlyOnStatusCodeFailure !== undefined) {
                     bean.retry_only_on_status_code_failure = monitor.retryOnlyOnStatusCodeFailure;
@@ -479,10 +505,6 @@ app.use(function (req, res, next) {
                 checkLogin(socket);
 
                 let bean = await R.findOne("monitor", " id = ? ", [monitor.id]);
-
-                if (bean.user_id !== socket.userID) {
-                    throw new Error("Permission denied.");
-                }
 
                 // Check if Parent is Descendant (would cause endless loop)
                 if (monitor.parent !== null) {
@@ -608,8 +630,10 @@ app.use(function (req, res, next) {
                 bean.rabbitmqPassword = monitor.rabbitmqPassword;
                 bean.conditions = JSON.stringify(monitor.conditions);
                 bean.manual_status = monitor.manual_status;
-                bean.system_service_name = monitor.system_service_name;
-                bean.expected_tls_alert = monitor.expectedTlsAlert;
+
+                // Known config keys only, so a payload never replaces the whole config
+                bean.applyClientConfig(monitor.config);
+
                 bean.sshUsername = monitor.sshUsername;
                 bean.sshPassword = monitor.sshPassword;
                 bean.sftpPath = monitor.sftpPath;
@@ -678,7 +702,7 @@ app.use(function (req, res, next) {
 
                 log.info("monitor", `Get Monitor: ${monitorID} User ID: ${socket.userID}`);
 
-                let monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+                let monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
                 const monitorData = [{ id: monitor.id, active: monitor.active }];
                 const preloadData = await Monitor.preparePreloadData(monitorData);
                 callback({
@@ -710,6 +734,24 @@ app.use(function (req, res, next) {
                     msg: e.message,
                     msgi18n: !!e.msgi18n,
                     meta: e.meta ?? {},
+                });
+            }
+        });
+
+        socket.on("getHeartbeatHistory", async (monitorID, callback) => {
+            try {
+                checkLogin(socket);
+                const data = await getHeartbeatHistory(monitorID);
+                log.debug("monitor", `History request #${monitorID} rows=${data.length}`);
+                callback({
+                    ok: true,
+                    data,
+                });
+            } catch (e) {
+                log.warn("monitor", `History request #${monitorID} failed: ${e.message}`);
+                callback({
+                    ok: false,
+                    msg: e.message,
                 });
             }
         });
@@ -801,7 +843,7 @@ app.use(function (req, res, next) {
                 const startTime = Date.now();
 
                 // Check if this is a group monitor
-                const monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+                const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
 
                 // Log with context about deletion type
                 if (monitor && monitor.type === "group") {
@@ -822,7 +864,7 @@ app.use(function (req, res, next) {
                         // Delete all child monitors recursively
                         if (children && children.length > 0) {
                             for (const child of children) {
-                                await Monitor.deleteMonitorRecursively(child.id, socket.userID);
+                                await Monitor.deleteMonitorRecursively(child.id);
                                 await server.sendDeleteMonitorFromList(socket, child.id);
                             }
                         }
@@ -840,7 +882,7 @@ app.use(function (req, res, next) {
                 }
 
                 // Delete the monitor itself
-                await Monitor.deleteMonitor(monitorID, socket.userID);
+                await Monitor.deleteMonitor(monitorID);
 
                 // Fix #2880
                 apicache.clear();
@@ -1150,9 +1192,19 @@ app.use(function (req, res, next) {
 
                 const previousChromeExecutable = await Settings.get("chromeExecutable");
                 const previousNSCDStatus = await Settings.get("nscd");
+                const previousPrometheusApiEnabled = await Settings.get("prometheusApiEnabled");
 
                 await setSettings("general", data);
                 server.entryPage = data.entryPage;
+
+                // Start or stop the Prometheus sampling when the API is toggled
+                if (previousPrometheusApiEnabled !== data.prometheusApiEnabled) {
+                    if (data.prometheusApiEnabled) {
+                        startPrometheusMetrics();
+                    } else {
+                        stopPrometheusMetrics();
+                    }
+                }
 
                 // Also need to apply timezone globally
                 if (data.serverTimezone) {
@@ -1216,7 +1268,7 @@ app.use(function (req, res, next) {
             try {
                 checkLogin(socket);
 
-                await Notification.delete(notificationID, socket.userID);
+                await Notification.delete(notificationID);
                 await sendNotificationList(socket);
 
                 callback({
@@ -1404,6 +1456,17 @@ app.use(function (req, res, next) {
 
         await startMonitors();
 
+        // Warm the dashboard/prometheus stats cache once, then refresh it periodically.
+        // Without this, every beat would load years of stat rows per monitor.
+        const statMonitorIDs = Object.keys(server.monitorList);
+        if (statMonitorIDs.length > 0) {
+            startStatsRefresh({
+                monitorIDs: statMonitorIDs,
+                refresh: (ids) => MonitorStats.refresh(ids),
+                onError: (e) => log.error("monitor", "Failed to refresh monitor stats: " + e.message),
+            });
+        }
+
         // Put this here. Start background jobs after the db and server is ready to prevent clear up during db migration.
         await initBackgroundJobs();
 
@@ -1435,21 +1498,6 @@ async function updateMonitorNotification(monitorID, notificationIDList) {
 }
 
 /**
- * Check if a given user owns a specific monitor
- * @param {number} userID ID of user to check
- * @param {number} monitorID ID of monitor to check
- * @returns {Promise<void>}
- * @throws {Error} The specified user does not own the monitor
- */
-async function checkOwner(userID, monitorID) {
-    let row = await R.getRow("SELECT id FROM monitor WHERE id = ? AND user_id = ? ", [monitorID, userID]);
-
-    if (!row) {
-        throw new Error("You do not own this monitor.");
-    }
-}
-
-/**
  * Function called after user login
  * This function is used to send the heartbeat list of a monitor.
  * @param {Socket} socket Socket.io instance
@@ -1459,28 +1507,53 @@ async function checkOwner(userID, monitorID) {
 async function afterLogin(socket, user) {
     socket.userID = user.id;
     socket.join(user.id);
+    socket.join(socketRoom);
 
+    let tPerf = Date.now();
     let monitorList = await server.sendMonitorList(socket);
+    log.debug("perf", `[login] sendMonitorList ${Date.now() - tPerf}ms`);
+    tPerf = Date.now();
     await Promise.allSettled([
         sendInfo(socket),
         server.sendMaintenanceList(socket),
         sendNotificationList(socket),
         sendProxyList(socket),
         sendDockerHostList(socket),
-        sendAPIKeyList(socket),
         sendRemoteBrowserList(socket),
         sendMonitorTypeList(socket),
     ]);
 
     await StatusPage.sendStatusPageList(io, socket);
+    log.debug("perf", `[login] misc lists ${Date.now() - tPerf}ms`);
+    tPerf = Date.now();
 
-    const monitorPromises = [];
-    for (let monitorID in monitorList) {
-        monitorPromises.push(sendHeartbeatList(socket, monitorID));
-        monitorPromises.push(Monitor.sendStats(io, monitorID, user.id));
-    }
+    const monitorIDs = Object.keys(monitorList);
 
-    await Promise.all(monitorPromises);
+    // The heartbeat and stats lists are another ~1.2 MB with thousands of monitors.
+    // Send them only after the client has painted the monitor list, so the dashboard
+    // becomes usable immediately instead of waiting for all three payloads.
+    const sendDeferredLists = async () => {
+        let t = Date.now();
+        // One event with every monitor's recent heartbeats, instead of one query + event per monitor
+        await sendHeartbeatLists(socket, monitorIDs);
+        log.debug("perf", `[login] heartbeatLists ${Date.now() - t}ms`);
+        t = Date.now();
+        // Serve the dashboard numbers from the cache. On a cold cache join the in-flight
+        // aggregate scan instead of showing empty numbers; this runs after first paint.
+        let stats = MonitorStats.getCached(monitorIDs);
+        if (Object.keys(stats).length < monitorIDs.length) {
+            stats = await MonitorStats.refresh(monitorIDs);
+        }
+        io.to(socket.userID).emit("stats", stats);
+        MonitorStats.maybeRefresh(io, monitorIDs);
+        log.debug("perf", `[login] stats ${Date.now() - t}ms`);
+    };
+    const deferredLists = new DeferredListsSender({
+        send: sendDeferredLists,
+        onError: (e) => log.error("monitor", "Failed to send dashboard lists: " + e.message),
+    });
+    socket.once("dashboardRendered", deferredLists.onRendered);
+    socket.once("disconnect", () => deferredLists.dispose());
 
     // Set server timezone from client browser if not set
     // It should be run once only
@@ -1512,11 +1585,9 @@ async function initDatabase(testMode = false) {
  * @returns {Promise<void>}
  */
 async function startMonitor(userID, monitorID) {
-    await checkOwner(userID, monitorID);
-
     log.info("manage", `Resume Monitor: ${monitorID} User ID: ${userID}`);
 
-    await R.exec("UPDATE monitor SET active = 1 WHERE id = ? AND user_id = ? ", [monitorID, userID]);
+    await R.exec("UPDATE monitor SET active = 1 WHERE id = ? ", [monitorID]);
 
     let monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
 
@@ -1545,11 +1616,9 @@ async function restartMonitor(userID, monitorID) {
  * @returns {Promise<void>}
  */
 async function pauseMonitor(userID, monitorID) {
-    await checkOwner(userID, monitorID);
-
     log.info("manage", `Pause Monitor: ${monitorID} User ID: ${userID}`);
 
-    await R.exec("UPDATE monitor SET active = 0 WHERE id = ? AND user_id = ? ", [monitorID, userID]);
+    await R.exec("UPDATE monitor SET active = 0 WHERE id = ? ", [monitorID]);
 
     if (monitorID in server.monitorList) {
         await server.monitorList[monitorID].stop();

@@ -168,8 +168,12 @@ export default {
                     this.settings.nscd = true;
                 }
 
+                if (this.settings.prometheusApiEnabled === undefined) {
+                    this.settings.prometheusApiEnabled = false;
+                }
+
                 if (this.settings.keepDataPeriodDays === undefined) {
-                    this.settings.keepDataPeriodDays = 180;
+                    this.settings.keepDataPeriodDays = 365;
                 }
 
                 if (this.settings.tlsExpiryNotifyDays === undefined) {
@@ -182,6 +186,10 @@ export default {
 
                 if (this.settings.trustProxy === undefined) {
                     this.settings.trustProxy = false;
+                }
+
+                if (this.settings.apiEnabled === undefined) {
+                    this.settings.apiEnabled = false;
                 }
 
                 this.settingsLoaded = true;

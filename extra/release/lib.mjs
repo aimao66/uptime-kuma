@@ -2,7 +2,7 @@ import { loadEnvFile } from "node:process";
 import * as childProcess from "child_process";
 import semver from "semver";
 import fs from "fs";
-import tar from "tar";
+import * as tar from "tar";
 
 try {
     loadEnvFile();
@@ -418,7 +418,7 @@ export function buildAllImages(repoNames, version, isBeta) {
         // Build slim image (rootless)
         buildImage(
             repoNames,
-            [`${majorVersion}-slim-rootless`, ver(version, "slim-rootless")],
+            [`next-slim-rootless`, `${majorVersion}-slim-rootless`, ver(version, "slim-rootless")],
             "rootless",
             `BASE_IMAGE=louislam/uptime-kuma:base${majorVersion}-slim`
         );
@@ -458,6 +458,7 @@ export function pressAnyKey() {
 
 /**
  * Append version identifier
+ * e.g. 2.5.12 + slim -> 2.5.12-slim, 3.0.0-beta.1 + slim -> 3.0.0-beta.1-slim
  * @param {string} version Version
  * @param {string} identifier Identifier
  * @returns {string} Version with identifier
@@ -465,12 +466,12 @@ export function pressAnyKey() {
 export function ver(version, identifier) {
     const obj = semver.parse(version);
 
-    if (obj.prerelease.length === 0) {
-        obj.prerelease = [identifier];
-    } else {
-        obj.prerelease[0] = [obj.prerelease[0], identifier].join("-");
+    if (!obj) {
+        throw new Error(`Invalid version: ${version}`);
     }
-    return obj.format();
+
+    // Keep the whole prerelease intact, so a suffix never lands inside it (3.0.0-beta-slim.1)
+    return `${obj.format()}-${identifier}`;
 }
 
 /**
@@ -619,7 +620,9 @@ The \`dist.tar.gz\` archive will be available as an artifact in the [workflow ru
 `;
 
     // Create the PR using gh CLI
-    const args = ["pr", "create", "--title", title, "--body", body, "--base", "master", "--head", branchName];
+    // RELEASE_BASE_BRANCH lets the release workflow target a maintenance branch (e.g. 2.5.X) instead of master
+    const baseBranch = process.env.RELEASE_BASE_BRANCH || "master";
+    const args = ["pr", "create", "--title", title, "--body", body, "--base", baseBranch, "--head", branchName];
 
     console.log(`Creating PR: ${title}`);
 

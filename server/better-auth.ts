@@ -1,23 +1,49 @@
-import { betterAuth, Session } from "better-auth";
+import { betterAuth } from "better-auth";
+import type { BetterAuthPlugin } from "better-auth";
+import { randomUUID } from "node:crypto";
 // @ts-ignore
 import * as Database from "./database.js";
-import { genSecret, log } from "../src/util";
-import { R } from "redbean-node";
+import { genSecret, isDevEnv, log } from "../src/util";
+import { R, type Bean } from "redbean-node";
 import { username } from "better-auth/plugins";
 import { admin } from "better-auth/plugins";
 import { Socket } from "socket.io";
 import { haveIBeenPwned } from "better-auth/plugins";
 import { twoFactor } from "better-auth/plugins";
 import { apiKey } from "@better-auth/api-key";
-import { createAuthMiddleware, APIError } from "better-auth/api";
+import { createAuthMiddleware, isAPIError } from "better-auth/api";
 // @ts-ignore
-import * as oldAuth from "./auth.js";
-import { hasUser } from "./routers/better-auth-router";
-import { symmetricEncrypt } from "better-auth/crypto";
+import * as oldAuth from "./auth";
+import { symmetricEncrypt, hashPassword } from "better-auth/crypto";
+// @ts-ignore
+import config from "./config.js";
 
 export type BetterAuthUser = ReturnType<typeof createAuthInstance>["$Infer"]["Session"]["user"];
 
+/**
+ * Unique internal email for a better-auth user, never used, only valid (#8210).
+ * @returns An internal email
+ */
+export function genInternalEmail() {
+    return `${randomUUID()}@noreply.uptime-kuma.internal`;
+}
+
 let authInstance: ReturnType<typeof createAuthInstance>;
+
+/**
+ * Whether the HIBP password check is enabled (`UPTIME_KUMA_DISABLE_LEAK_PWD_CHECK` / `--disable-leak-pwd-check`).
+ * @returns True to run the check
+ */
+function isHaveIBeenPwnedEnabled() {
+    const disableHibp = process.env.UPTIME_KUMA_DISABLE_LEAK_PWD_CHECK;
+    const disabledByEnv = !!disableHibp && disableHibp !== "false" && disableHibp !== "0";
+    return !disabledByEnv && !config.args["disable-leak-pwd-check"];
+}
+
+// Shared haveIBeenPwned plugin options; `enabled` is turned off during legacy user migration (#7946).
+const haveIBeenPwnedOptions = {
+    enabled: true,
+};
 
 /**
  * Get the singleton instance of better-auth
@@ -44,6 +70,48 @@ export async function authInternal() {
 }
 
 /**
+ * Whether the leaked-password check could not run (service unreachable).
+ * @param error Error thrown while hashing a password
+ * @returns True to hash without the check
+ */
+function isLeakCheckUnavailable(error: unknown): boolean {
+    return isAPIError(error) && error.statusCode === 500 && error.message.startsWith("Failed to check password");
+}
+
+/**
+ * Keep setup and password changes working without internet (#8212).
+ * @returns Plugin wrapping the check above
+ */
+function leakCheckFailOpen(): BetterAuthPlugin {
+    return {
+        id: "leak-check-fail-open",
+        init(ctx) {
+            const hashWithLeakCheck = ctx.password.hash;
+            return {
+                context: {
+                    password: {
+                        ...ctx.password,
+                        async hash(password: string) {
+                            try {
+                                return await hashWithLeakCheck(password);
+                            } catch (e) {
+                                if (!isLeakCheckUnavailable(e)) {
+                                    throw e;
+                                }
+
+                                // No internet: the check cannot run, so let the password through
+                                log.warn("auth", "Leaked-password service is unreachable, skipping the check.");
+                                return hashPassword(password);
+                            }
+                        },
+                    },
+                },
+            };
+        },
+    };
+}
+
+/**
  * Create a new instance of better-auth
  * @throws Error if Database.initDataDir() has not been called
  * @returns A new instance
@@ -54,6 +122,12 @@ function createAuthInstance() {
         throw new Error(
             "Database data directory is not initialized. Please call Database.initDataDir() before using auth."
         );
+    }
+
+    // Apply the UPTIME_KUMA_DISABLE_LEAK_PWD_CHECK / --disable-leak-pwd-check setting
+    haveIBeenPwnedOptions.enabled = isHaveIBeenPwnedEnabled();
+    if (!haveIBeenPwnedOptions.enabled) {
+        log.warn("auth", "haveIBeenPwned password check is disabled (UPTIME_KUMA_DISABLE_LEAK_PWD_CHECK).");
     }
 
     const authDatabase = Database.createAuthDatabase(Database.dbConfig);
@@ -68,12 +142,35 @@ function createAuthInstance() {
         secret: getAuthSecret(),
         // Should be handled in Express.js, check better-auth-router.ts
         trustedOrigins: ["*"],
+
+        // Since multiple users are not supported yet, disable these paths to prevent accidental usage
+        disabledPaths: [
+            "/admin/create-user",
+            "/admin/get-user",
+            "/admin/list-users",
+            "/admin/update-user",
+            "/admin/set-user-password",
+            "/admin/set-role",
+            "/admin/ban-user",
+            "/admin/unban-user",
+            "/admin/impersonate-user",
+            "/admin/stop-impersonating",
+            "/admin/remove-user",
+            "/admin/list-user-sessions",
+            "/admin/revoke-user-session",
+            "/admin/revoke-user-sessions",
+            "/admin/has-permission",
+        ],
+
         emailAndPassword: {
             revokeSessionsOnPasswordReset: true,
             enabled: true,
-            disableSignUp: false,
+            disableSignUp: true,
         },
         rateLimit: {
+            // Disabled in development (e.g. E2E tests) to avoid throttling rapid logins
+            enabled: !isDevEnv(),
+
             // Seconds
             window: 60,
 
@@ -82,23 +179,37 @@ function createAuthInstance() {
         },
         plugins: [
             // Enable login by username
-            username(),
+            username({
+                // v1/v2 accepted any username (email, spaces, non-Latin), the defaults allow only [a-zA-Z0-9_.] (#8210)
+                usernameValidator: () => true,
+                minUsernameLength: 1,
+                maxUsernameLength: 255,
+            }),
 
             // Enable user management API (used for creating the first admin user)
             admin(),
 
             // Check if the password has been pwned in data breaches
-            haveIBeenPwned(),
+            haveIBeenPwned(haveIBeenPwnedOptions),
+
+            // Keep setup and password changes working when the service above cannot be reached
+            leakCheckFailOpen(),
 
             twoFactor({
                 schema: {
                     twoFactor: {
-                        modelName: "better_auth_twoFactor",
+                        modelName: "better_auth_twofactor",
                     },
                 },
             }),
 
             apiKey({
+                // Allow the socket and HTTP API to authenticate with an API key
+                enableSessionForAPIKeys: true,
+                // Better Auth defaults to 10 requests per key per 24h; Uptime Kuma limits in requireApiKey instead
+                rateLimit: {
+                    enabled: false,
+                },
                 schema: {
                     apikey: {
                         modelName: "better_auth_apikey",
@@ -128,9 +239,12 @@ function createAuthInstance() {
                     const username = ctx.body?.username;
                     const password = ctx.body?.password;
 
-                    // Migrate legacy user from old user table to better-auth
-                    // Only do this when there is no user in better-auth
-                    if (!(await hasUser())) {
+                    // Migrate the legacy user while better-auth has no password for it
+                    const credentialAccount = await R.knex("better_auth_account")
+                        .where({ providerId: "credential" })
+                        .first();
+
+                    if (!credentialAccount) {
                         await migrateUser(username, password);
                     }
                 }
@@ -185,6 +299,41 @@ export function getSession(cookie: string) {
 }
 
 /**
+ * Get session from incoming request headers, either a cookie or an API key
+ * @param cookie Cookie string of the request
+ * @param apiKey API key of the request
+ * @returns Session Object, or null when the request is not authenticated
+ */
+export async function getSessionFromHeaders(cookie?: string, apiKey?: string | string[]) {
+    // Prefer the browser session, an API key never overrides a valid cookie
+    if (cookie) {
+        const cookieSession = await authInstance.api.getSession({
+            headers: createHeaders(cookie),
+        });
+
+        if (cookieSession) {
+            return cookieSession;
+        }
+    }
+
+    if (typeof apiKey !== "string" || !apiKey) {
+        return null;
+    }
+
+    try {
+        const sessionHeaders = new Headers();
+        sessionHeaders.set("x-api-key", apiKey);
+
+        return await authInstance.api.getSession({
+            headers: sessionHeaders,
+        });
+    } catch (e) {
+        // Better Auth throws for an invalid API key
+        return null;
+    }
+}
+
+/**
  * Create Headers object with cookie for API calls
  * @param cookie Cookie string
  * @returns Headers object
@@ -202,7 +351,19 @@ export function createHeaders(cookie: string) {
 export async function getDisableAuthSession(): ReturnType<typeof getSession> {
     log.info("auth", "Logged in with Disable Auth");
 
-    const obj = await R.getRow("SELECT * FROM better_auth_user LIMIT 1");
+    let obj = await R.getRow("SELECT * FROM better_auth_user LIMIT 1");
+
+    if (!obj) {
+        // Disable Auth never signs in, so import the v2 user here
+        const legacyUser = await R.getRow("SELECT * FROM user ORDER BY id LIMIT 1");
+
+        if (!legacyUser) {
+            throw new Error("Unexpected Error: No user found in the database.");
+        }
+
+        await importLegacyUserForDisableAuth(legacyUser);
+        obj = await R.getRow("SELECT * FROM better_auth_user LIMIT 1");
+    }
 
     if (!obj) {
         throw new Error("Unexpected Error: No user found in the database.");
@@ -241,6 +402,32 @@ export async function getDisableAuthSession(): ReturnType<typeof getSession> {
 }
 
 /**
+ * Import the v2 user into better-auth for Disable Auth, no password or 2FA yet.
+ * @param legacyUser Row of the old `user` table
+ */
+async function importLegacyUserForDisableAuth(legacyUser: Bean) {
+    const userId = String(legacyUser.id);
+    log.info("auth", `Disable Auth is importing the legacy user: ${legacyUser.username}`);
+
+    const now = new Date();
+    await R.knex("better_auth_user")
+        .insert({
+            id: userId,
+            name: legacyUser.username,
+            email: `legacy-${legacyUser.id}@noreply.uptime-kuma.internal`,
+            emailVerified: false,
+            createdAt: now,
+            updatedAt: now,
+            username: legacyUser.username,
+            displayUsername: legacyUser.username,
+            role: "admin",
+        })
+        // Two sockets can connect at the same time
+        .onConflict("id")
+        .ignore();
+}
+
+/**
  * Check Login (Better Auth New!)
  * @param socket Socket.IO Socket
  * @throws Error if not logged in
@@ -272,6 +459,21 @@ export async function doubleCheckPassword(cookie: string, currentPassword: strin
 }
 
 /**
+ * Verify an API key with Better Auth
+ * @param key Clear API key
+ * @returns True if the key is valid
+ */
+export async function verifyApiKey(key: string): Promise<boolean> {
+    const result = await auth().api.verifyApiKey({
+        body: {
+            key,
+        },
+    });
+
+    return result.valid;
+}
+
+/**
  * Migrate a legacy user from the old `user` table to better-auth tables.
  * @param username Legacy username
  * @param password Plain-text password from the login form
@@ -279,12 +481,32 @@ export async function doubleCheckPassword(cookie: string, currentPassword: strin
 export async function migrateUser(username: string, password: string) {
     const legacyUser = await oldAuth.login(username, password);
     if (legacyUser) {
+        // Disable Auth imported the user row without a password, attach it now
+        const importedUser = await R.knex("better_auth_user").where({ username }).first();
+        if (importedUser) {
+            const internalAdapter = await authInternal();
+            const accounts = await internalAdapter.findAccounts(importedUser.id);
+
+            if (!accounts.some((account) => account.providerId === "credential")) {
+                await internalAdapter.linkAccount({
+                    userId: importedUser.id,
+                    accountId: importedUser.id,
+                    providerId: "credential",
+                    password: await hashPassword(password),
+                });
+                log.info("auth", `Attached the legacy password to the imported user: ${username}`);
+            }
+            return;
+        }
+
+        // Skip the HIBP check: the legacy user's existing password must not be rejected (#7946)
+        haveIBeenPwnedOptions.enabled = false;
         try {
             // Create BetterAuth user with the same username and password
             const newUser = await auth().api.createUser({
                 body: {
                     name: username,
-                    email: `${username}@noreply.uptime-kuma.internal`,
+                    email: genInternalEmail(),
                     password,
                     role: "admin",
                     data: {
@@ -303,7 +525,7 @@ export async function migrateUser(username: string, password: string) {
                 const encryptedSecret = await betterAuthEncrypt(legacyUser.twofa_secret);
                 const encryptedBackupCodes = await betterAuthEncrypt(JSON.stringify([])); // Empty backup codes for migration, as we don't have the original backup codes
 
-                await R.knex("better_auth_twoFactor").insert({
+                await R.knex("better_auth_twofactor").insert({
                     id: rowId,
                     secret: encryptedSecret,
                     backupCodes: encryptedBackupCodes,
@@ -318,6 +540,8 @@ export async function migrateUser(username: string, password: string) {
             log.info("auth", `Migrated legacy user: ${username}`);
         } catch (e) {
             log.error("auth", `Failed to migrate legacy user ${username}:`, e);
+        } finally {
+            haveIBeenPwnedOptions.enabled = isHaveIBeenPwnedEnabled();
         }
     } else {
         log.info("auth", `No legacy user found for username: ${username}, do not migrate.`);
@@ -335,7 +559,7 @@ export async function checkPassword(username: string, password: string): Promise
     const { adapter, password: passwordVerifier } = await auth().$context;
     const internalAdapter = await authInternal();
 
-    const user = await adapter.findOne<Record<string, any>>({
+    const user = await adapter.findOne<Record<string, unknown>>({
         model: "user",
         where: [{ field: "username", value: username }],
     });

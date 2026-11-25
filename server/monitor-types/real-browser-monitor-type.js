@@ -7,7 +7,7 @@ const path = require("path");
 const Database = require("../database");
 const config = require("../config");
 const { RemoteBrowser } = require("../remote-browser");
-const { commandExists } = require("../util-server");
+const { commandExists } = require("../util");
 
 /**
  * Cached instance of a browser
@@ -94,11 +94,10 @@ async function getBrowser() {
 /**
  * Get the current instance of the browser. If there isn't one, create it
  * @param {integer} remoteBrowserID Path to executable
- * @param {integer} userId User ID
  * @returns {Promise<Browser>} The browser
  */
-async function getRemoteBrowser(remoteBrowserID, userId) {
-    let remoteBrowser = await RemoteBrowser.get(remoteBrowserID, userId);
+async function getRemoteBrowser(remoteBrowserID) {
+    let remoteBrowser = await RemoteBrowser.get(remoteBrowserID);
     log.debug("chromium", `Using remote browser: ${remoteBrowser.name} (${remoteBrowser.id})`);
     browser = await chromium.connect(remoteBrowser.url);
     return browser;
@@ -249,9 +248,7 @@ class RealBrowserMonitorType extends MonitorType {
      * @inheritdoc
      */
     async check(monitor, heartbeat, server) {
-        const browser = monitor.remote_browser
-            ? await getRemoteBrowser(monitor.remote_browser, monitor.user_id)
-            : await getBrowser();
+        const browser = monitor.remote_browser ? await getRemoteBrowser(monitor.remote_browser) : await getBrowser();
         const context = await browser.newContext();
         try {
             const page = await context.newPage();
@@ -265,7 +262,7 @@ class RealBrowserMonitorType extends MonitorType {
             }
 
             const res = await page.goto(monitor.url, {
-                waitUntil: "networkidle",
+                waitUntil: "domcontentloaded",
                 timeout: monitor.interval * 1000 * 0.8,
             });
 

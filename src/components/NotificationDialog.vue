@@ -267,6 +267,7 @@ export default {
                 pushover: "Pushover",
                 pushy: "Pushy",
                 signalgrid: "Signalgrid",
+                trigv: "Trigv",
                 Webpush: "Webpush",
             };
 
@@ -291,6 +292,7 @@ export default {
             // Email - Email services
             let email = {
                 Brevo: "Brevo",
+                MicrosoftGraph: this.$t("Microsoft Graph Email"),
                 Resend: "Resend",
                 SendGrid: "SendGrid",
                 smtp: this.$t("smtp"),
@@ -307,6 +309,7 @@ export default {
                 HeiiOnCall: "Heii On-Call",
                 Keep: "Keep",
                 Opsgenie: "Opsgenie",
+                OpsiMate: "OpsiMate",
                 JiraServiceManagement: this.$t("Jira Service Management"),
                 PagerDuty: "PagerDuty",
                 PagerTree: "PagerTree",
@@ -318,6 +321,7 @@ export default {
             // Home Automation - Smart home and IoT platforms
             let homeAutomation = {
                 HomeAssistant: "Home Assistant",
+                Indigo: "Indigo",
             };
 
             // Other Integrations

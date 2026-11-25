@@ -168,7 +168,7 @@ class Database {
             fs.mkdirSync(Database.screenshotDir, { recursive: true });
         }
 
-        Database.dockerTLSDir = path.join(Database.dataDir, "docker-tls/");
+        Database.dockerTLSDir = process.env.DOCKER_TLS_DIR_PATH || path.join(Database.dataDir, "docker-tls/");
         if (!fs.existsSync(Database.dockerTLSDir)) {
             fs.mkdirSync(Database.dockerTLSDir, { recursive: true });
         }
@@ -453,9 +453,6 @@ class Database {
         } else if (dbConfig.type.endsWith("mariadb")) {
             await this.initMariaDB();
         }
-
-        // Also connect better-auth
-        auth(true);
     }
 
     /**
@@ -546,6 +543,9 @@ class Database {
                 throw e;
             }
         }
+
+        // Init better-auth only after the migrations, so its schema check sees the migrated tables
+        auth(true);
     }
 
     /**
@@ -555,11 +555,11 @@ class Database {
      */
     static createAuthDatabase(dbConfig) {
         let database;
-        if (dbConfig.type.includes("mariadb")) {
+        if (dbConfig.type === "mariadb") {
             database = mysql.createPool({
-                host: dbConfig.host,
+                host: dbConfig.hostname,
                 port: Number(dbConfig.port),
-                database: dbConfig.database,
+                database: dbConfig.dbName,
                 user: dbConfig.username,
                 password: dbConfig.password,
                 timezone: "Z",
@@ -860,6 +860,11 @@ class Database {
             }
         }
         log.info("db", "Database closed");
+
+        // Stop Embedded MariaDB if this process started it, so CLI tools can exit
+        if (Database.dbConfig.type === "embedded-mariadb" && EmbeddedMariaDB.hasInstance()) {
+            EmbeddedMariaDB.getInstance().stop();
+        }
 
         process.removeListener("unhandledRejection", listener);
     }

@@ -1,12 +1,12 @@
 import express from "express";
 import { toNodeHandler } from "better-auth/node";
-import { auth } from "../better-auth";
+import { auth, genInternalEmail } from "../better-auth";
+import { Settings } from "../settings";
 import { R } from "redbean-node";
 import { log } from "../../src/util";
 
 // @ts-ignore
-import { allowDevOrigin } from "../util-server.js";
-import { generalErrorResponse } from "../util2";
+import { allowDevOrigin, generalErrorResponse, shouldSecureCookies, secureResponseCookies } from "../util";
 
 let processingSetup = false;
 let _hasUser = false;
@@ -23,6 +23,17 @@ export async function createBetterAuthRouter() {
     const betterAuthRouter = express.Router();
     betterAuthRouter.all("/api/auth/*", async (req, res) => {
         allowDevOrigin(req, res);
+
+        if (shouldSecureCookies(req)) {
+            secureResponseCookies(res);
+        }
+
+        // Trust Proxy off: the header is client-controlled, so replace it with the socket address
+        // A header is the only way to pass the socket IP to better-auth
+        if (!(await Settings.get("trustProxy"))) {
+            req.headers["x-forwarded-for"] = req.socket.remoteAddress;
+        }
+
         return toNodeHandler(auth())(req, res);
     });
 
@@ -40,31 +51,21 @@ export async function createBetterAuthRouter() {
                 throw new Error("Setup is already in progress. Please wait.");
             }
 
+            processingSetup = true;
+
             try {
                 if (!(await needSetup())) {
                     throw new Error(
                         "Uptime Kuma has been initialized. If you want to run setup again, please delete the database."
                     );
                 }
-                processingSetup = true;
 
                 const username = req.body.username;
                 const password = req.body.password;
-                const user = await auth().api.createUser({
-                    body: {
-                        name: username,
-                        email: `${username}@noreply.uptime-kuma.internal`,
-                        password,
-                        role: "admin",
-                        data: {
-                            username,
-                        },
-                    },
-                });
 
+                const user = await createFirstAdmin(username, password);
                 log.debug("auth", "First user created:", user);
 
-                _hasUser = true;
                 res.json({ ok: true });
             } finally {
                 processingSetup = false;
@@ -79,14 +80,89 @@ export async function createBetterAuthRouter() {
 }
 
 /**
- *
+ * Whether Better Auth has a user.
+ * @param {boolean} checkLegacyUser Also check the old `user` table
+ * @returns {Promise<boolean>} Whether a user exists
  */
-export async function hasUser() {
+export async function hasUser(checkLegacyUser = false) {
     if (_hasUser) {
         return true;
     }
+
     const { count } = await R.knex("better_auth_user").count("id as count").first();
-    return Number(count) !== 0;
+    if (Number(count) !== 0) {
+        return true;
+    }
+
+    if (!checkLegacyUser) {
+        return false;
+    }
+
+    // The user may be in the old user table, check that as well
+    const oldUserCountRow = await R.knex("user").count("id as count").first();
+    return Number(oldUserCountRow.count) !== 0;
+}
+
+/**
+ * Remove the user that `createUser()` inserted before the leaked-password check failed.
+ * @param {string} username Username of the partially created user
+ * @returns {Promise<void>}
+ */
+async function removePartialFirstAdmin(username: string) {
+    if (!username) {
+        return;
+    }
+
+    try {
+        const users = await R.knex("better_auth_user").where({ username }).select("id");
+        const ids = users.map((user: { id: string }) => user.id);
+
+        if (ids.length > 0) {
+            await R.knex("better_auth_account").whereIn("userId", ids).del();
+            await R.knex("better_auth_user").whereIn("id", ids).del();
+        }
+    } catch (cleanupError) {
+        log.error("auth", "Failed to clean up the partially created admin:", cleanupError);
+    }
+}
+
+/**
+ * Create the first admin user.
+ * @param {string} username Admin username
+ * @param {string} password Admin password
+ * @returns {Promise<object>} The created user
+ * @throws {Error} If Uptime Kuma already has a user, or Better Auth rejects the user
+ */
+export async function createFirstAdmin(username: string, password: string) {
+    if (await hasUser(true)) {
+        throw new Error(
+            "Uptime Kuma has been initialized. If you want to run setup again, please delete the database."
+        );
+    }
+
+    const body = {
+        name: username,
+        // Unique per user; the email is never used
+        email: genInternalEmail(),
+        password,
+        role: "admin",
+        data: {
+            username,
+        },
+    };
+
+    let user;
+    try {
+        user = await auth().api.createUser({ body });
+    } catch (createError) {
+        // HIBP rejected after admin user creation, we need to clean up the partially created user
+        // very stupid.... https://github.com/better-auth/better-auth/issues/11706
+        await removePartialFirstAdmin(username);
+        throw createError;
+    }
+
+    _hasUser = true;
+    return user;
 }
 
 /**
@@ -101,21 +177,13 @@ export async function needSetup() {
             },
             1000 * 60 * 10
         );
+        // Do not keep the process alive (tests, CLI tools) just for this timer
+        setupTimeout.unref();
     }
 
     if (expired) {
         return false;
     }
-    if (processingSetup) {
-        return false;
-    }
 
-    if (await hasUser()) {
-        return false;
-    }
-
-    // The user may be in the old user table, check that as well
-    const oldUserCountRow = await R.knex("user").count("id as count").first();
-    const hasOldUser = Number(oldUserCountRow.count) !== 0;
-    return !hasOldUser;
+    return !(await hasUser(true));
 }
